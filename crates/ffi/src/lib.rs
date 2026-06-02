@@ -1,4 +1,4 @@
-use rift::{Create, Error, Manager};
+use rift::{Create, Error, Init, Manager};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ struct Request {
 enum Command {
     Init {
         at: PathBuf,
+        worktrees: Option<bool>,
     },
     Create {
         from: PathBuf,
@@ -105,8 +106,11 @@ fn execute(input: &str) -> Result<Value, Failure> {
         .map_or_else(Manager::open_default, Manager::open)
         .map_err(Failure::from)?;
     match request.command {
-        Command::Init { at } => manager
-            .init(at)
+        Command::Init { at, worktrees } => manager
+            .init_options(Init {
+                at,
+                worktrees: worktrees.unwrap_or(false),
+            })
             .map(|_| Value::Empty(()))
             .map_err(Failure::from),
         Command::Create { from, name, into } => manager
