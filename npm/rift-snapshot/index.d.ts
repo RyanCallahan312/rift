@@ -6,6 +6,10 @@ export interface AtOptions extends Options {
   at?: string
 }
 
+export interface InitOptions extends AtOptions {
+  worktrees?: boolean
+}
+
 export interface CreateOptions extends Options {
   from?: string
   name?: string
@@ -47,7 +51,7 @@ export class RiftError extends Error {
   constructor(input: { code: RiftErrorCode; message: string; path?: string })
 }
 
-export function init(options?: AtOptions): null
+export function init(options?: InitOptions): null
 export function create(options?: CreateOptions): string
 export function remove(options?: RemoveOptions & { all: true }): string[]
 export function remove(options?: RemoveOptions): void
