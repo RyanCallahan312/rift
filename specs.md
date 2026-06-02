@@ -11,6 +11,7 @@
 ```ts
 init(input: {
   at: AbsolutePath
+  worktrees?: boolean
 }): void
 ```
 
@@ -25,6 +26,7 @@ init(input: {
 - The CLI defaults `at` to the current working directory; by default it selects the nearest existing managed ancestor or nearest Git root, prints the selected path, and then invokes core `init` with that exact path. `--here` opts into selecting exactly the supplied path.
 - Calling `init` inside an already initialized workspace reports the existing root; if that root's `.rift` marker was deleted, `init` restores the marker using its existing registry identity.
 - After a conversion it tells the caller to re-enter the original path.
+- If `worktrees` is true, `at` must be a Git repository root with an inline `.git` directory. Rift moves that `.git` directory into its user data directory, writes a `.git` pointer file in the workspace, records the external shared Git directory in the registry, and future rifts from that root are registered as Git worktrees.
 
 ### `create`
 
@@ -133,7 +135,10 @@ CREATE TABLE rift (
   id TEXT PRIMARY KEY,
   parent_id TEXT REFERENCES rift(id) ON DELETE CASCADE,
   path TEXT NOT NULL UNIQUE,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  git_storage_mode TEXT NOT NULL DEFAULT 'inline',
+  shared_git_dir TEXT,
+  git_worktree_dir TEXT
 );
 
 CREATE INDEX rift_parent_id_idx ON rift(parent_id);
@@ -141,7 +146,9 @@ CREATE INDEX rift_parent_id_idx ON rift(parent_id);
 CREATE TABLE trash (
   id TEXT PRIMARY KEY,
   path TEXT NOT NULL UNIQUE,
-  removed_at INTEGER NOT NULL
+  removed_at INTEGER NOT NULL,
+  shared_git_dir TEXT,
+  git_worktree_dir TEXT
 );
 ```
 
@@ -167,10 +174,11 @@ When registering or creating from a Git repository:
 - If `HEAD` resolves to a commit, detach `HEAD` in the created destination at that same commit.
 - Preserve the copied index and working tree state while detaching.
 - If the repository has no commits yet, leave its unborn branch state unchanged because there is no commit to detach to.
+- If the registered root was initialized with `worktrees: true`, create the destination with the normal copy-on-write strategy, replace the copied `.git` pointer with a new per-worktree pointer, create the corresponding Git worktree metadata under the shared Git directory, and copy the source worktree index so staged state is preserved.
 
 Refuse creation from a Git repository when:
 
-- It is a linked Git worktree whose `.git` is not an independent directory.
+- It is a linked Git worktree whose `.git` is not an independent directory, unless the repository belongs to a Rift root initialized with `worktrees: true`.
 - A merge, rebase, cherry-pick, revert, or bisect is in progress.
 - Git lock or inconsistent index state makes an exact safe copy unclear.
 
