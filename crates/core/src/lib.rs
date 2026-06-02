@@ -4,10 +4,12 @@ mod marker;
 mod name;
 mod registry;
 mod strategy;
+mod worktree;
 
 use id::RiftId;
 use name::RiftName;
 use registry::{MovedRecord, PathRecord, Record, Registry, SubtreeScope};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use strategy::{Strategy, StrategyInit};
@@ -57,6 +59,33 @@ pub struct Create {
     pub into: Option<PathBuf>,
 }
 
+pub struct Init {
+    pub at: PathBuf,
+    pub worktrees: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GitStorageMode {
+    Inline,
+    SharedWorktrees,
+}
+
+impl GitStorageMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Inline => "inline",
+            Self::SharedWorktrees => "shared_worktrees",
+        }
+    }
+
+    pub(crate) fn from_stored(value: String) -> Self {
+        match value.as_str() {
+            "shared_worktrees" => Self::SharedWorktrees,
+            _ => Self::Inline,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InitProgress {
     CreatingSubvolume,
@@ -84,6 +113,7 @@ impl InitOutcome {
 pub struct Manager {
     registry: Registry,
     strategy: Box<dyn Strategy>,
+    repo_storage: PathBuf,
 }
 
 impl Manager {
@@ -101,15 +131,36 @@ impl Manager {
 
     fn with_strategy(path: impl AsRef<Path>, strategy: Box<dyn Strategy>) -> Result<Self> {
         let registry = Registry::open(path)?;
-        Ok(Self { registry, strategy })
+        Ok(Self {
+            registry,
+            strategy,
+            repo_storage: default_repo_storage()?,
+        })
+    }
+
+    #[cfg(test)]
+    fn with_strategy_and_repo_storage(
+        path: impl AsRef<Path>,
+        strategy: Box<dyn Strategy>,
+        repo_storage: PathBuf,
+    ) -> Result<Self> {
+        let registry = Registry::open(path)?;
+        Ok(Self {
+            registry,
+            strategy,
+            repo_storage,
+        })
     }
 
     pub fn create(&mut self, input: Create) -> Result<PathBuf> {
         let requested = existing_directory(&input.from)?;
         let source = self.workspace_from(&requested)?;
         let from = source.path.clone();
-        let git = git::check_source(&from)?;
         let root = self.root(&source)?;
+        let git = match root.git_storage_mode {
+            GitStorageMode::Inline => git::check_source(&from)?,
+            GitStorageMode::SharedWorktrees => git::check_source_allow_worktree(&from)?,
+        };
         let id = RiftId::new();
         let destination_parent = match input.into {
             Some(path) => absolute_path(&path)?,
@@ -136,19 +187,52 @@ impl Manager {
             return Err(error);
         }
 
+        let mut git_worktree_dir = None;
         let result = (|| {
-            marker::write(&destination, &id)?;
-            if git.is_repository() {
-                git::hide_marker(&destination)?;
-                git::detach_destination(&destination)?;
+            match root.git_storage_mode {
+                GitStorageMode::Inline => {
+                    marker::write(&destination, &id)?;
+                    if git.is_repository() {
+                        git::hide_marker(&destination)?;
+                        git::detach_destination(&destination)?;
+                    }
+                    if git.is_repository() {
+                        git::hide_marker(&from)?;
+                    }
+                }
+                GitStorageMode::SharedWorktrees => {
+                    let shared_git_dir = root.shared_git_dir.as_ref().ok_or_else(|| {
+                        Error::UnsafeGit("shared Git directory is missing from registry".into())
+                    })?;
+                    if git.is_repository() {
+                        let registered =
+                            worktree::register_cow_clone(shared_git_dir, &from, &destination, &id)?;
+                        git_worktree_dir = Some(registered.git_dir);
+                        git::hide_marker(&destination)?;
+                        git::hide_marker(&from)?;
+                    }
+                    marker::write(&destination, &id)?;
+                }
             }
-            if git.is_repository() {
-                git::hide_marker(&from)?;
-            }
-            self.registry.insert_child(&id, &source.id, &destination)?;
+            self.registry.insert_child(
+                &id,
+                &source.id,
+                &destination,
+                root.git_storage_mode,
+                root.shared_git_dir.as_deref(),
+                git_worktree_dir.as_deref(),
+            )?;
             Ok(destination.clone())
         })();
         if result.is_err() {
+            if let (Some(shared_git_dir), Some(git_worktree_dir)) =
+                (root.shared_git_dir.as_ref(), git_worktree_dir.as_ref())
+            {
+                if worktree::validate_worktree_dir(shared_git_dir, git_worktree_dir).is_ok() {
+                    let _ = worktree::remove_registered_worktree(git_worktree_dir);
+                    let _ = worktree::prune(shared_git_dir);
+                }
+            }
             let _ = self.strategy.remove_directory(&destination);
         }
         result
@@ -158,14 +242,40 @@ impl Manager {
         self.init_with_progress(at, |_| {})
     }
 
+    pub fn init_options(&mut self, input: Init) -> Result<InitOutcome> {
+        self.init_options_with_progress(input, |_| {})
+    }
+
     pub fn init_with_progress(
         &mut self,
         at: impl AsRef<Path>,
+        progress: impl FnMut(InitProgress),
+    ) -> Result<InitOutcome> {
+        self.init_options_with_progress(
+            Init {
+                at: at.as_ref().to_path_buf(),
+                worktrees: false,
+            },
+            progress,
+        )
+    }
+
+    pub fn init_options_with_progress(
+        &mut self,
+        input: Init,
         mut progress: impl FnMut(InitProgress),
     ) -> Result<InitOutcome> {
-        let at = existing_directory(at.as_ref())?;
-        let git = git::check_source(&at)?;
+        let at = existing_directory(&input.at)?;
         if let Some(record) = self.registry.record_at(&at)? {
+            if input.worktrees && record.git_storage_mode != GitStorageMode::SharedWorktrees {
+                return Err(Error::UnsafeGit(
+                    "workspace is already initialized without --worktrees".into(),
+                ));
+            }
+            let git = match record.git_storage_mode {
+                GitStorageMode::Inline => git::check_source(&at)?,
+                GitStorageMode::SharedWorktrees => git::check_source_allow_worktree(&at)?,
+            };
             if marker::read(&at)?.is_none() {
                 progress(InitProgress::RestoringMarker);
                 marker::write(&at, &record.id)?;
@@ -181,19 +291,43 @@ impl Manager {
                 StrategyInit::Converted => InitOutcome::Converted,
             });
         }
+        let git = if input.worktrees {
+            git::check_source_allow_worktree(&at)?
+        } else {
+            git::check_source(&at)?
+        };
         if marker::read(&at)?.is_some() {
             return Err(Error::MarkerMismatch(at));
+        }
+        if input.worktrees && !git.is_repository() {
+            return Err(Error::UnsafeGit(
+                "rift init --worktrees requires a Git repository".into(),
+            ));
+        }
+        if input.worktrees {
+            worktree::ensure_head_commit(&at)?;
         }
 
         let converted = self.strategy.initialize_directory(&at, &mut progress)?;
         progress(InitProgress::RegisteringWorkspace);
         let id = RiftId::new();
+        let shared_git = if input.worktrees {
+            Some(worktree::initialize_root(&at, &id, &self.repo_storage)?.git_dir)
+        } else {
+            None
+        };
+        let git_storage_mode = if input.worktrees {
+            GitStorageMode::SharedWorktrees
+        } else {
+            GitStorageMode::Inline
+        };
         let result = (|| {
             marker::write(&at, &id)?;
             if git.is_repository() {
                 git::hide_marker(&at)?;
             }
-            self.registry.insert_root(&id, &at)?;
+            self.registry
+                .insert_root(&id, &at, git_storage_mode, shared_git.as_deref())?;
             Ok(match converted {
                 StrategyInit::AlreadyNative => InitOutcome::Registered,
                 StrategyInit::Converted => InitOutcome::Converted,
@@ -201,6 +335,9 @@ impl Manager {
         })();
         if result.is_err() {
             let _ = fs::remove_file(marker::path(&at));
+            if let Some(shared_git) = &shared_git {
+                worktree::restore_inline_root(&at, shared_git)?;
+            }
         }
         result
     }
@@ -234,10 +371,27 @@ impl Manager {
             .registry
             .subtree(&record.id, SubtreeScope::DescendantsOnly)?;
         let existing = rows
-            .into_iter()
+            .iter()
             .filter(|record| record.path.exists())
+            .cloned()
             .collect::<Vec<_>>();
+        let missing = rows
+            .iter()
+            .filter(|record| !record.path.exists())
+            .cloned()
+            .collect::<Vec<_>>();
+        if record.git_storage_mode == GitStorageMode::SharedWorktrees {
+            if let Some(shared_git_dir) = &record.shared_git_dir {
+                worktree::validate_inline_root_restore(&record.path, shared_git_dir)?;
+            }
+        }
         self.trash_rows(&existing)?;
+        cleanup_worktrees(&missing)?;
+        if record.git_storage_mode == GitStorageMode::SharedWorktrees {
+            if let Some(shared_git_dir) = &record.shared_git_dir {
+                worktree::restore_inline_root(&record.path, shared_git_dir)?;
+            }
+        }
         fs::remove_file(marker::path(&record.path))?;
         self.registry.delete_active(&record.id)?;
         Ok(())
@@ -289,8 +443,9 @@ impl Manager {
             for record in moved.iter().rev() {
                 let _ = fs::rename(&record.trash_path, &record.original_path);
             }
+            return result;
         }
-        result
+        cleanup_worktrees(rows)
     }
 
     pub fn list(&self, of: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
@@ -314,9 +469,9 @@ impl Manager {
     }
 
     pub fn gc(&mut self) -> Result<Vec<PathBuf>> {
-        let removed = self
-            .registry
-            .trashed_paths()?
+        let trashed = self.registry.trashed_paths()?;
+        cleanup_worktrees(&trashed)?;
+        let removed = trashed
             .into_iter()
             .map(|row| -> Result<PathBuf> {
                 if row.path.exists() {
@@ -344,6 +499,7 @@ impl Manager {
             })
             .filter_map(Result::transpose)
             .collect::<Result<Vec<_>>>()?;
+        cleanup_worktrees(&missing)?;
         self.registry.delete_active_records(&missing)?;
         Ok(removed
             .into_iter()
@@ -402,6 +558,12 @@ fn default_database_path() -> Result<PathBuf> {
     Ok(base.join("rift").join("rift.sqlite"))
 }
 
+fn default_repo_storage() -> Result<PathBuf> {
+    let base = dirs::data_local_dir()
+        .ok_or_else(|| Error::Path("user data directory is unavailable".into()))?;
+    Ok(base.join("rift").join("repos"))
+}
+
 fn existing_directory(path: &Path) -> Result<PathBuf> {
     let path = fs::canonicalize(path)?;
     if !path.is_dir() {
@@ -439,6 +601,26 @@ fn trash_path(id: &RiftId, path: &Path) -> Result<PathBuf> {
         .join(format!("{id}-{}", name.to_string_lossy())))
 }
 
+fn cleanup_worktrees(rows: &[PathRecord]) -> Result<()> {
+    let mut pruned = HashSet::<PathBuf>::new();
+    for row in rows {
+        let Some(shared_git_dir) = &row.shared_git_dir else {
+            continue;
+        };
+
+        if let Some(git_dir) = &row.git_worktree_dir {
+            worktree::validate_worktree_dir(shared_git_dir, git_dir)?;
+            worktree::remove_registered_worktree(git_dir)?;
+            if pruned.insert(shared_git_dir.clone()) && shared_git_dir.exists() {
+                worktree::prune(shared_git_dir)?;
+            }
+        } else {
+            worktree::remove_shared_git_storage(shared_git_dir, &row.id)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,7 +632,12 @@ mod tests {
     use ulid::Ulid;
 
     fn manager(temp: &TempDir) -> Manager {
-        Manager::with_strategy(temp.path().join("registry.sqlite"), Box::new(TestStrategy)).unwrap()
+        Manager::with_strategy_and_repo_storage(
+            temp.path().join("registry.sqlite"),
+            Box::new(TestStrategy),
+            temp.path().join("repos"),
+        )
+        .unwrap()
     }
 
     fn source(temp: &TempDir) -> PathBuf {
@@ -1220,6 +1407,246 @@ mod tests {
     }
 
     #[test]
+    fn init_worktrees_externalizes_git_directory() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        let mut manager = manager(&temp);
+
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+
+        assert!(source.join(".git").is_file());
+        let record = manager.registry.record_at(&source).unwrap().unwrap();
+        assert_eq!(record.git_storage_mode, GitStorageMode::SharedWorktrees);
+        let shared_git_dir = record.shared_git_dir.unwrap();
+        assert!(shared_git_dir.is_dir());
+        assert!(shared_git_dir.starts_with(temp.path().join("repos")));
+        assert_eq!(
+            fs::read_to_string(source.join(".git")).unwrap(),
+            format!("gitdir: {}\n", shared_git_dir.display())
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+
+        let _ = fs::remove_dir_all(shared_git_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn init_worktrees_is_idempotent_without_flag() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        let mut manager = manager(&temp);
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+
+        assert_eq!(
+            manager.init(&source).unwrap(),
+            InitOutcome::AlreadyInitialized
+        );
+    }
+
+    #[test]
+    fn init_worktrees_rejects_unborn_repository_before_externalizing_git() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        run(&source, &["init"]);
+        let mut manager = manager(&temp);
+
+        let error = manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, Error::UnsafeGit(_)));
+        assert!(source.join(".git").is_dir());
+        assert!(manager.registry.record_at(&source).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_worktrees_rejects_git_symlink() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        fs::rename(source.join(".git"), source.join("actual.git")).unwrap();
+        std::os::unix::fs::symlink(source.join("actual.git"), source.join(".git")).unwrap();
+        let mut manager = manager(&temp);
+
+        let error = manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, Error::UnsafeGit(_)));
+        assert!(source.join(".git").is_symlink());
+        assert!(source.join("actual.git").is_dir());
+    }
+
+    #[test]
+    fn create_from_worktree_root_registers_child_as_git_worktree() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        fs::write(source.join("file.txt"), "changed").unwrap();
+        run(&source, &["add", "file.txt"]);
+        fs::write(source.join("untracked.txt"), "new").unwrap();
+        let mut manager = manager(&temp);
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+
+        let destination = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("worktree".into()),
+                into: None,
+            })
+            .unwrap();
+
+        assert!(destination.join(".git").is_file());
+        assert!(destination.join("untracked.txt").exists());
+        let staged = Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["diff", "--cached", "--name-only"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&staged.stdout).contains("file.txt"));
+        assert!(
+            !Command::new("git")
+                .arg("-C")
+                .arg(&destination)
+                .args(["symbolic-ref", "-q", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        run(&source, &["branch", "shared-ref"]);
+        let branches = Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["branch", "--list", "shared-ref"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branches.stdout).contains("shared-ref"));
+
+        let root = manager
+            .root(&manager.workspace_at(&source).unwrap())
+            .unwrap();
+        let shared_git_dir = root.shared_git_dir.unwrap();
+        let worktrees = Command::new("git")
+            .arg("--git-dir")
+            .arg(&shared_git_dir)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&worktrees.stdout).contains(destination.to_str().unwrap()));
+
+        manager.remove(&destination).unwrap();
+        let worktrees = Command::new("git")
+            .arg("--git-dir")
+            .arg(&shared_git_dir)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&worktrees.stdout).contains(destination.to_str().unwrap())
+        );
+        let _ = fs::remove_dir_all(shared_git_dir.parent().unwrap());
+    }
+
+    #[test]
+    fn remove_worktree_root_restores_inline_git_directory() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        let mut manager = manager(&temp);
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+        assert!(source.join(".git").is_file());
+        let shared_git_dir = manager
+            .registry
+            .record_at(&source)
+            .unwrap()
+            .unwrap()
+            .shared_git_dir
+            .unwrap();
+
+        manager.remove(&source).unwrap();
+
+        assert!(source.join(".git").is_dir());
+        assert!(!shared_git_dir.parent().unwrap().exists());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(String::from_utf8_lossy(&status.stdout).is_empty());
+    }
+
+    #[test]
+    fn remove_worktree_root_cleans_missing_child_git_metadata() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        let mut manager = manager(&temp);
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+        let child = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("missing".into()),
+                into: None,
+            })
+            .unwrap();
+        let child_id = marker_id(&child);
+        fs::remove_dir_all(&child).unwrap();
+
+        manager.remove(&source).unwrap();
+
+        assert!(source.join(".git").is_dir());
+        assert!(
+            !source
+                .join(".git/worktrees")
+                .join(child_id.as_str())
+                .exists()
+        );
+    }
+
+    #[test]
     fn create_requires_an_initialized_workspace() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
@@ -1288,5 +1715,13 @@ mod tests {
                 .unwrap()
                 .success()
         );
+    }
+
+    fn initialize_git_repo(path: &Path) {
+        run(path, &["init"]);
+        run(path, &["config", "user.email", "test@example.com"]);
+        run(path, &["config", "user.name", "Test"]);
+        run(path, &["add", "file.txt"]);
+        run(path, &["commit", "-m", "initial"]);
     }
 }
