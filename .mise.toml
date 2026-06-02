@@ -1,0 +1,4 @@
+[tools]
+rust = "stable"
+node = "24"
+bun = "latest"
