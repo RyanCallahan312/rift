@@ -38,11 +38,14 @@ Release archives are available from [GitHub Releases](https://github.com/anomaly
 ```bash
 cd ~/code/app
 rift init
+rift init --worktrees
 ```
 
 `rift init` selects an existing Rift root above the current directory, or the nearest Git root when no Rift root exists. Use `--here` to initialize exactly the selected directory.
 
 On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. On XFS, initialization verifies that the filesystem supports reflinks and registers the directory in place. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required setup.
+
+Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees. This moves the repository's `.git` directory into Rift's data directory, leaves a `.git` pointer file in the workspace, and makes future rifts share Git refs, objects, and config through that external Git directory. Do not delete the Rift data directory for a worktree-initialized repo while its workspaces still exist.
 
 ### Create
 
@@ -57,6 +60,8 @@ rift create --into /fast/rifts
 On btrfs, it creates a writable subvolume snapshot. On XFS, it reflink-clones the directory tree. On macOS, it uses APFS `clonefile`.
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
+
+When the root was initialized with `rift init --worktrees`, created rifts are also registered as Git worktrees and appear in `git worktree list`.
 
 ### List And Ancestors
 
@@ -130,7 +135,7 @@ With Node's permission model, also pass `--allow-ffi`.
 ### Functions
 
 ```ts
-init(options?: { at?: string; database?: string }): null
+init(options?: { at?: string; worktrees?: boolean; database?: string }): null
 create(options?: { from?: string; name?: string; into?: string; database?: string }): string
 remove(options?: { at?: string; all?: false; database?: string }): void
 remove(options: { at?: string; all: true; database?: string }): string[]
