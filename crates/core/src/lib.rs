@@ -1426,6 +1426,7 @@ mod tests {
         let shared_git_dir = record.shared_git_dir.unwrap();
         assert!(shared_git_dir.is_dir());
         assert!(shared_git_dir.starts_with(temp.path().join("repos")));
+        assert_eq!(shared_git_dir.file_name().unwrap(), "rift-manager");
         assert_eq!(
             fs::read_to_string(source.join(".git")).unwrap(),
             format!("gitdir: {}\n", shared_git_dir.display())
@@ -1557,6 +1558,7 @@ mod tests {
             .root(&manager.workspace_at(&source).unwrap())
             .unwrap();
         let shared_git_dir = root.shared_git_dir.unwrap();
+        assert_eq!(shared_git_dir.file_name().unwrap(), "rift-manager");
         let worktrees = Command::new("git")
             .arg("--git-dir")
             .arg(&shared_git_dir)
@@ -1598,6 +1600,7 @@ mod tests {
             .unwrap()
             .shared_git_dir
             .unwrap();
+        assert_eq!(shared_git_dir.file_name().unwrap(), "rift-manager");
 
         manager.remove(&source).unwrap();
 
