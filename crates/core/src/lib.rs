@@ -312,7 +312,12 @@ impl Manager {
         progress(InitProgress::RegisteringWorkspace);
         let id = RiftId::new();
         let shared_git = if input.worktrees {
-            Some(worktree::initialize_root(&at, &id, &self.repo_storage)?.git_dir)
+            Some(
+                worktree::initialize_root(&at, &id, &self.repo_storage, |from, to| {
+                    self.strategy.copy_directory(from, to)
+                })?
+                .git_dir,
+            )
         } else {
             None
         };
@@ -336,7 +341,7 @@ impl Manager {
         if result.is_err() {
             let _ = fs::remove_file(marker::path(&at));
             if let Some(shared_git) = &shared_git {
-                worktree::restore_inline_root(&at, shared_git)?;
+                let _ = worktree::remove_shared_git_storage(shared_git, &id);
             }
         }
         result
@@ -380,17 +385,10 @@ impl Manager {
             .filter(|record| !record.path.exists())
             .cloned()
             .collect::<Vec<_>>();
-        if record.git_storage_mode == GitStorageMode::SharedWorktrees {
-            if let Some(shared_git_dir) = &record.shared_git_dir {
-                worktree::validate_inline_root_restore(&record.path, shared_git_dir)?;
-            }
-        }
         self.trash_rows(&existing)?;
         cleanup_worktrees(&missing)?;
-        if record.git_storage_mode == GitStorageMode::SharedWorktrees {
-            if let Some(shared_git_dir) = &record.shared_git_dir {
-                worktree::restore_inline_root(&record.path, shared_git_dir)?;
-            }
+        if let Some(shared_git_dir) = &record.shared_git_dir {
+            worktree::remove_shared_git_storage(shared_git_dir, &record.id)?;
         }
         fs::remove_file(marker::path(&record.path))?;
         self.registry.delete_active(&record.id)?;
@@ -1407,7 +1405,7 @@ mod tests {
     }
 
     #[test]
-    fn init_worktrees_externalizes_git_directory() {
+    fn init_worktrees_snapshots_git_directory_without_mutating_root() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         initialize_git_repo(&source);
@@ -1420,17 +1418,14 @@ mod tests {
             })
             .unwrap();
 
-        assert!(source.join(".git").is_file());
+        assert!(source.join(".git").is_dir());
         let record = manager.registry.record_at(&source).unwrap().unwrap();
         assert_eq!(record.git_storage_mode, GitStorageMode::SharedWorktrees);
         let shared_git_dir = record.shared_git_dir.unwrap();
         assert!(shared_git_dir.is_dir());
         assert!(shared_git_dir.starts_with(temp.path().join("repos")));
         assert_eq!(shared_git_dir.file_name().unwrap(), "rift-manager");
-        assert_eq!(
-            fs::read_to_string(source.join(".git")).unwrap(),
-            format!("gitdir: {}\n", shared_git_dir.display())
-        );
+        assert!(source.join(".git/HEAD").exists());
         let status = Command::new("git")
             .arg("-C")
             .arg(&source)
@@ -1462,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn init_worktrees_rejects_unborn_repository_before_externalizing_git() {
+    fn init_worktrees_rejects_unborn_repository_before_snapshotting_git() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         run(&source, &["init"]);
@@ -1545,15 +1540,6 @@ mod tests {
                 .success()
         );
 
-        run(&source, &["branch", "shared-ref"]);
-        let branches = Command::new("git")
-            .arg("-C")
-            .arg(&destination)
-            .args(["branch", "--list", "shared-ref"])
-            .output()
-            .unwrap();
-        assert!(String::from_utf8_lossy(&branches.stdout).contains("shared-ref"));
-
         let root = manager
             .root(&manager.workspace_at(&source).unwrap())
             .unwrap();
@@ -1581,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_root_restores_inline_git_directory() {
+    fn create_from_worktree_root_imports_new_root_commits_into_snapshot() {
         let temp = TempDir::new().unwrap();
         let source = source(&temp);
         initialize_git_repo(&source);
@@ -1592,7 +1578,57 @@ mod tests {
                 worktrees: true,
             })
             .unwrap();
-        assert!(source.join(".git").is_file());
+
+        fs::write(source.join("later.txt"), "later").unwrap();
+        run(&source, &["add", "later.txt"]);
+        run(&source, &["commit", "-m", "later"]);
+        let expected = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+
+        let destination = manager
+            .create(Create {
+                from: source.clone(),
+                name: Some("later-worktree".into()),
+                into: None,
+            })
+            .unwrap();
+
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout),
+            String::from_utf8_lossy(&expected.stdout)
+        );
+        let branch = Command::new("git")
+            .arg("-C")
+            .arg(&destination)
+            .args(["branch", "--show-current"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branch.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn remove_worktree_root_preserves_inline_git_directory() {
+        let temp = TempDir::new().unwrap();
+        let source = source(&temp);
+        initialize_git_repo(&source);
+        let mut manager = manager(&temp);
+        manager
+            .init_options(Init {
+                at: source.clone(),
+                worktrees: true,
+            })
+            .unwrap();
+        assert!(source.join(".git").is_dir());
         let shared_git_dir = manager
             .registry
             .record_at(&source)

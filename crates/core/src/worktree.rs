@@ -2,7 +2,6 @@ use crate::git;
 use crate::id::RiftId;
 use crate::{Error, Result};
 use std::fs;
-use std::io;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +24,7 @@ pub(crate) fn initialize_root(
     path: &Path,
     root_id: &RiftId,
     repo_storage: &Path,
+    copy_directory: impl FnOnce(&Path, &Path) -> Result<()>,
 ) -> Result<SharedGitRoot> {
     let inline_git = path.join(".git");
     if !real_directory(&inline_git)? {
@@ -53,27 +53,18 @@ pub(crate) fn initialize_root(
     let result = (|| {
         fs::create_dir_all(repos)?;
         fs::create_dir_all(&staging_parent)?;
-        fs::rename(&inline_git, &staging_git)?;
-        write_git_pointer(&inline_git, &staging_git)?;
-        configure_external_root(&staging_git, path)?;
-        validate_worktree(path)?;
+        copy_directory(&inline_git, &staging_git)?;
+        configure_snapshot_root(&staging_git)?;
+        validate_snapshot_root(&staging_git)?;
         fs::rename(&staging_parent, &final_parent)?;
-        write_git_pointer(&inline_git, &final_git)?;
-        configure_external_root(&final_git, path)?;
-        validate_worktree(path)?;
+        validate_snapshot_root(&final_git)?;
         Ok(SharedGitRoot {
             git_dir: final_git.clone(),
         })
     })();
 
     if result.is_err() {
-        rollback_initialize_root(
-            &inline_git,
-            &staging_git,
-            &final_git,
-            &staging_parent,
-            &final_parent,
-        );
+        rollback_initialize_root(&staging_parent, &final_parent);
     }
     result
 }
@@ -94,6 +85,7 @@ pub(crate) fn register_cow_clone(
     id: &RiftId,
 ) -> Result<RegisteredWorktree> {
     let head = head_state(source)?;
+    import_source_head(root_git_dir, source, &head)?;
     let git_dir = root_git_dir.join("worktrees").join(id.as_str());
     if git_dir.exists() {
         return Err(Error::AlreadyExists(git_dir));
@@ -164,53 +156,6 @@ pub(crate) fn remove_shared_git_storage(shared_git_dir: &Path, root_id: &RiftId)
     Ok(())
 }
 
-pub(crate) fn validate_inline_root_restore(worktree: &Path, shared_git_dir: &Path) -> Result<()> {
-    let git = worktree.join(".git");
-    if git.exists() {
-        let metadata = fs::symlink_metadata(&git)?;
-        if metadata.is_dir() && shared_git_dir.exists() {
-            return Err(Error::UnsafeGit(format!(
-                "cannot restore inline Git metadata over existing directory: {}",
-                git.display()
-            )));
-        }
-    }
-    if !git.is_dir() && !shared_git_dir.exists() {
-        return Err(Error::UnsafeGit(format!(
-            "shared Git directory is missing: {}",
-            shared_git_dir.display()
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn restore_inline_root(worktree: &Path, shared_git_dir: &Path) -> Result<()> {
-    validate_inline_root_restore(worktree, shared_git_dir)?;
-    let git = worktree.join(".git");
-    if git.exists() {
-        let metadata = fs::symlink_metadata(&git)?;
-        if metadata.is_dir() {
-            if !shared_git_dir.exists() {
-                configure_inline_root(&git)?;
-                remove_empty_storage_parent(shared_git_dir);
-                return Ok(());
-            }
-            return Err(Error::UnsafeGit(format!(
-                "cannot restore inline Git metadata over existing directory: {}",
-                git.display()
-            )));
-        }
-        fs::remove_file(&git)?;
-    }
-    if let Err(error) = move_dir(shared_git_dir, &git) {
-        let _ = write_git_pointer(&git, shared_git_dir);
-        return Err(error);
-    }
-    configure_inline_root(&git)?;
-    remove_empty_storage_parent(shared_git_dir);
-    Ok(())
-}
-
 pub(crate) fn prune(root_git_dir: &Path) -> Result<()> {
     let output = Command::new("git")
         .arg("--git-dir")
@@ -262,10 +207,13 @@ fn ensure_toplevel(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn configure_external_root(git_dir: &Path, worktree: &Path) -> Result<()> {
-    let worktree = worktree.to_string_lossy().into_owned();
-    run_git(git_dir, &["config", "core.worktree", &worktree])?;
-    run_git(git_dir, &["config", "core.bare", "false"])
+fn configure_snapshot_root(git_dir: &Path) -> Result<()> {
+    let _ = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["config", "--unset", "core.worktree"])
+        .status();
+    run_git(git_dir, &["config", "core.bare", "true"])
 }
 
 fn validate_worktree(path: &Path) -> Result<()> {
@@ -283,8 +231,29 @@ fn validate_worktree(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_snapshot_root(git_dir: &Path) -> Result<()> {
+    run_git(git_dir, &["rev-parse", "--is-bare-repository"])
+}
+
 fn validate_worktree_list(root_git_dir: &Path) -> Result<()> {
     run_git(root_git_dir, &["worktree", "list", "--porcelain"])
+}
+
+fn import_source_head(root_git_dir: &Path, source: &Path, head: &HeadState) -> Result<()> {
+    let Some(source_dirs) = git::resolve_dirs(source)? else {
+        return Err(Error::UnsafeGit("source is not a Git repository".into()));
+    };
+    if source_dirs.common_dir == root_git_dir {
+        return Ok(());
+    }
+    let HeadState::Commit(commit) = head else {
+        return Ok(());
+    };
+    if snapshot_has_commit(root_git_dir, commit)? {
+        return Ok(());
+    }
+    let source_repo = source.to_string_lossy().into_owned();
+    run_git(root_git_dir, &["fetch", "--quiet", "--no-tags", &source_repo, commit])
 }
 
 fn run_worktree(worktree: &Path, args: &[&str]) -> Result<()> {
@@ -315,6 +284,15 @@ fn run_git(git_dir: &Path, args: &[&str]) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn snapshot_has_commit(git_dir: &Path, commit: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .output()?;
+    Ok(output.status.success())
 }
 
 enum HeadState {
@@ -382,108 +360,15 @@ fn write_git_pointer(path: &Path, git_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn rollback_initialize_root(
-    inline_git: &Path,
-    staging_git: &Path,
-    final_git: &Path,
-    staging_parent: &Path,
-    final_parent: &Path,
-) {
-    let restored = if final_git.exists() {
-        restore_git_dir(final_git, inline_git).is_ok()
-    } else if staging_git.exists() {
-        restore_git_dir(staging_git, inline_git).is_ok()
-    } else {
-        false
-    };
-
-    if restored {
-        let _ = fs::remove_dir_all(staging_parent);
-        let _ = fs::remove_dir_all(final_parent);
-    }
-}
-
-fn restore_git_dir(source: &Path, destination: &Path) -> Result<()> {
-    if destination.exists() {
-        let metadata = fs::symlink_metadata(destination)?;
-        if metadata.is_dir() {
-            return Err(Error::UnsafeGit(format!(
-                "cannot restore Git metadata over existing directory: {}",
-                destination.display()
-            )));
-        }
-        fs::remove_file(destination)?;
-    }
-    move_dir(source, destination)
-}
-
-fn configure_inline_root(git_dir: &Path) -> Result<()> {
-    let _ = Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["config", "--unset", "core.worktree"])
-        .status();
-    run_git(git_dir, &["config", "core.bare", "false"])
-}
-
-fn move_dir(source: &Path, destination: &Path) -> Result<()> {
-    match fs::rename(source, destination) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {
-            let temporary = destination.with_extension("rift-restore-tmp");
-            if temporary.exists() {
-                return Err(Error::AlreadyExists(temporary));
-            }
-            copy_dir_all(source, &temporary)?;
-            fs::rename(&temporary, destination)?;
-            fs::remove_dir_all(source)?;
-            Ok(())
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn copy_dir_all(source: &Path, destination: &Path) -> Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        if file_type.is_dir() {
-            copy_dir_all(&from, &to)?;
-        } else if file_type.is_symlink() {
-            copy_symlink(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)?;
-        }
-    }
-    Ok(())
-}
-
-fn remove_empty_storage_parent(shared_git_dir: &Path) {
-    if let Some(parent) = shared_git_dir.parent() {
-        let _ = fs::remove_dir(parent);
-    }
+fn rollback_initialize_root(staging_parent: &Path, final_parent: &Path) {
+    let _ = fs::remove_dir_all(staging_parent);
+    let _ = fs::remove_dir_all(final_parent);
 }
 
 fn real_directory(path: &Path) -> Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.is_dir() && !metadata.file_type().is_symlink()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
-}
-
-#[cfg(unix)]
-fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
-    let target = fs::read_link(source)?;
-    std::os::unix::fs::symlink(target, destination)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
-    fs::copy(source, destination)?;
-    Ok(())
 }
