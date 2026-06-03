@@ -45,7 +45,7 @@ rift init --worktrees
 
 On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. On XFS, initialization verifies that the filesystem supports reflinks and registers the directory in place. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required setup.
 
-Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees. This moves the repository's `.git` directory into Rift's data directory, leaves a `.git` pointer file in the workspace, and makes future rifts share Git refs, objects, and config through that external Git directory. Do not delete the Rift data directory for a worktree-initialized repo while its workspaces still exist.
+Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees. This moves the repository's `.git` directory into Rift's data directory, leaves a `.git` pointer file in the workspace, and makes future rifts share Git refs, objects, and config through that external Git directory. The shared Git storage is named `rift-manager` under Rift's repo storage. Do not delete the Rift data directory for a worktree-initialized repo while its workspaces still exist.
 
 ### Create
 

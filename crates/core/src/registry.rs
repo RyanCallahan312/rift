@@ -474,7 +474,7 @@ mod tests {
         let root = temp.path().join("root");
         let child = temp.path().join("child");
         let trash = temp.path().join(".trash/child");
-        let root_git = temp.path().join("rift/repos/root/git");
+        let root_git = temp.path().join("rift/repos/root/rift-manager");
         let child_git = root_git.join("worktrees/child");
         let root_id = id("root");
         let child_id = id("child");
@@ -521,7 +521,7 @@ mod tests {
         let (temp, registry) = registry();
         let root = temp.path().join("root");
         let child = temp.path().join("child");
-        let root_git = temp.path().join("rift/repos/root/git");
+        let root_git = temp.path().join("rift/repos/root/rift-manager");
         let child_git = root_git.join("worktrees/child");
         let root_id = id("root");
         let child_id = id("child");

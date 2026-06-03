@@ -7,6 +7,8 @@ use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const SHARED_GIT_DIR_NAME: &str = "rift-manager";
+
 pub(crate) struct SharedGitRoot {
     pub(crate) git_dir: PathBuf,
 }
@@ -16,7 +18,7 @@ pub(crate) struct RegisteredWorktree {
 }
 
 pub(crate) fn shared_git_dir_for(repo_storage: &Path, root_id: &RiftId) -> PathBuf {
-    repo_storage.join(root_id.as_str()).join("git")
+    repo_storage.join(root_id.as_str()).join(SHARED_GIT_DIR_NAME)
 }
 
 pub(crate) fn initialize_root(
@@ -38,7 +40,7 @@ pub(crate) fn initialize_root(
         .ok_or_else(|| Error::Path(format!("Git dir has no parent: {}", final_git.display())))?;
     let final_parent = final_parent.to_path_buf();
     let staging_parent = final_parent.with_extension("tmp");
-    let staging_git = staging_parent.join("git");
+    let staging_git = staging_parent.join(SHARED_GIT_DIR_NAME);
     if final_parent.exists() || staging_parent.exists() {
         return Err(Error::AlreadyExists(final_parent.to_path_buf()));
     }
@@ -148,7 +150,7 @@ pub(crate) fn remove_shared_git_storage(shared_git_dir: &Path, root_id: &RiftId)
         .components()
         .any(|component| matches!(component, Component::ParentDir));
     if unsafe_components
-        || shared_git_dir.file_name() != Some(std::ffi::OsStr::new("git"))
+        || shared_git_dir.file_name() != Some(std::ffi::OsStr::new(SHARED_GIT_DIR_NAME))
         || parent.file_name() != Some(std::ffi::OsStr::new(root_id.as_str()))
     {
         return Err(Error::UnsafeGit(format!(
