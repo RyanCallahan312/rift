@@ -45,7 +45,7 @@ rift init --worktrees
 
 On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. On XFS, initialization verifies that the filesystem supports reflinks and registers the directory in place. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required setup.
 
-Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees. This moves the repository's `.git` directory into Rift's data directory, leaves a `.git` pointer file in the workspace, and makes future rifts share Git refs, objects, and config through that external Git directory. The shared Git storage is named `rift-manager` under Rift's repo storage. Do not delete the Rift data directory for a worktree-initialized repo while its workspaces still exist.
+Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees without rewriting the root repository. Rift snapshots the root `.git` directory into Rift-managed storage, leaves the root workspace unchanged, and makes future rifts share refs, objects, and config through that forked Git snapshot. The shared Git storage is named `rift-manager` under Rift's repo storage. Commits and branches created in the root after initialization are not mirrored back into the rift snapshot, but creating a new rift from the root imports the root's current `HEAD` commit so the new rift starts from the latest tree state.
 
 ### Create
 
@@ -61,7 +61,7 @@ On btrfs, it creates a writable subvolume snapshot. On XFS, it reflink-clones th
 
 When the workspace is a Git repository, the new workspace has detached `HEAD` and retains index and working-tree state.
 
-When the root was initialized with `rift init --worktrees`, created rifts are also registered as Git worktrees and appear in `git worktree list`.
+When the root was initialized with `rift init --worktrees`, created rifts are registered as Git worktrees in Rift's forked Git snapshot and appear in `git --git-dir <shared snapshot> worktree list`.
 
 ### List And Ancestors
 
