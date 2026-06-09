@@ -1,5 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
-use rift::{CopyMode, Create, CreateOptions, HookMode, InitProgress, Manager};
+use rift::{CopyMode, Create, CreateOptions, HookMode, Init, InitProgress, Manager};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -89,6 +89,11 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long)]
         here: bool,
+        #[arg(
+            long,
+            help = "Move .git into Rift data storage and register future rifts as Git worktrees"
+        )]
+        worktrees: bool,
     },
     Create {
         from: Option<PathBuf>,
@@ -161,26 +166,36 @@ fn run() -> Result<()> {
             print_shell_init(shell);
             Ok(())
         }
-        Command::Init { at, here } => {
+        Command::Init {
+            at,
+            here,
+            worktrees,
+        } => {
             let requested = std::fs::canonicalize(at.unwrap_or(std::env::current_dir()?))?;
             let (at, existing, missing_marker) = init_target(&manager, &requested, here)?;
             let initialized_from_inside = std::env::current_dir()?.starts_with(&at);
             let mut converting = false;
-            let outcome = manager.init_with_progress(&at, |progress| match progress {
-                InitProgress::CreatingSubvolume => {
-                    converting = true;
-                    eprintln!("Initializing  {}\n", at.display());
-                    eprintln!("First-time setup can take a moment.");
-                    eprintln!("New rifts will be instant.\n");
-                    eprintln!("Creating BTRFS subvolume...");
-                }
-                InitProgress::ImportingWorkspace => eprintln!("Importing workspace..."),
-                InitProgress::ImportedEntries { .. } => {}
-                InitProgress::ActivatingWorkspace
-                | InitProgress::RegisteringWorkspace
-                | InitProgress::RestoringMarker
-                | InitProgress::RemovingOriginal => {}
-            })?;
+            let outcome = manager.init_options_with_progress(
+                Init {
+                    at: at.clone(),
+                    worktrees,
+                },
+                |progress| match progress {
+                    InitProgress::CreatingSubvolume => {
+                        converting = true;
+                        eprintln!("Initializing  {}\n", at.display());
+                        eprintln!("First-time setup can take a moment.");
+                        eprintln!("New rifts will be instant.\n");
+                        eprintln!("Creating BTRFS subvolume...");
+                    }
+                    InitProgress::ImportingWorkspace => eprintln!("Importing workspace..."),
+                    InitProgress::ImportedEntries { .. } => {}
+                    InitProgress::ActivatingWorkspace
+                    | InitProgress::RegisteringWorkspace
+                    | InitProgress::RestoringMarker
+                    | InitProgress::RemovingOriginal => {}
+                },
+            )?;
             if outcome.is_converted() {
                 if converting {
                     eprintln!("\nReady  {}", at.display());
