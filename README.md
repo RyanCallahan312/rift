@@ -38,11 +38,14 @@ Release archives are available from [GitHub Releases](https://github.com/anomaly
 ```bash
 cd ~/code/app
 rift init
+rift init --worktrees
 ```
 
 `rift init` selects an existing Rift root above the current directory, or the nearest Git root when no Rift root exists. Use `--here` to initialize exactly the selected directory.
 
 On Linux, first initialization of an ordinary btrfs directory performs a reflink import into a new btrfs subvolume and swaps it into the same path. On other Linux filesystems, initialization verifies native reflink support and registers the directory in place. This includes XFS and other filesystems when their `FICLONE` support succeeds. If the selected root is registered already, no conversion occurs. If its `.rift` marker is missing, `rift init` restores it and completes any required setup.
+
+Use `rift init --worktrees` for Git repositories when future rifts should be registered as real Git worktrees without rewriting the root repository. Rift snapshots the root `.git` directory into Rift-managed storage, leaves the root workspace unchanged, and makes future rifts share refs, objects, and config through that forked Git snapshot. The shared Git storage is named `rift-manager` under Rift's repo storage. Commits and branches created in the root after initialization are not mirrored back into the rift snapshot, but creating a new rift from the root imports the root's current `HEAD` commit so the new rift starts from the latest tree state.
 
 ### Create
 
@@ -75,6 +78,7 @@ run = "pnpm run codegen"
 ```
 
 Postcreate commands run in the new workspace root. If a hook fails, the workspace remains registered and `rift create` exits with an error.
+When the root was initialized with `rift init --worktrees`, created rifts are registered as Git worktrees in Rift's forked Git snapshot and appear in `git --git-dir <shared snapshot> worktree list`.
 
 ### List And Ancestors
 
@@ -148,7 +152,7 @@ With Node's permission model, also pass `--allow-ffi`.
 ### Functions
 
 ```ts
-init(options?: { at?: string; database?: string }): null
+init(options?: { at?: string; worktrees?: boolean; database?: string }): null
 create(options?: { from?: string; name?: string; into?: string; copyAll?: boolean; hooks?: boolean; database?: string }): string
 remove(options?: { at?: string; all?: false; database?: string }): void
 remove(options: { at?: string; all: true; database?: string }): string[]

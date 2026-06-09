@@ -1,4 +1,4 @@
-use rift::{CopyMode, Create, CreateOptions, Error, HookMode, Manager};
+use rift::{CopyMode, Create, CreateOptions, Error, HookMode, Init, Manager};
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, c_char};
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ struct Request {
 enum Command {
     Init {
         at: PathBuf,
+        worktrees: Option<bool>,
     },
     Create {
         from: PathBuf,
@@ -110,8 +111,11 @@ fn execute(input: &str) -> Result<Value, Failure> {
         .map_or_else(Manager::open_default, Manager::open)
         .map_err(Failure::from)?;
     match request.command {
-        Command::Init { at } => manager
-            .init(at)
+        Command::Init { at, worktrees } => manager
+            .init_options(Init {
+                at,
+                worktrees: worktrees.unwrap_or(false),
+            })
             .map(|_| Value::Empty(()))
             .map_err(Failure::from),
         Command::Create {
@@ -265,6 +269,26 @@ mod tests {
             Command::Create {
                 copy_all: Some(true),
                 hooks: Some(false),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn init_worktrees_option_is_accepted_by_the_protocol() {
+        let request = serde_json::from_str::<Request>(
+            r#"{
+                "command": "init",
+                "at": "/tmp/app",
+                "worktrees": true
+            }"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            request.command,
+            Command::Init {
+                worktrees: Some(true),
                 ..
             }
         ));

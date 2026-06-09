@@ -40,8 +40,8 @@ export class RiftError extends Error {
   }
 }
 
-export function init({ at = process.cwd(), database } = {}) {
-  return call({ command: "init", at, database })
+export function init({ at = process.cwd(), worktrees = false, database } = {}) {
+  return call({ command: "init", at, worktrees, database })
 }
 
 export function create({ from = process.cwd(), name, into, copyAll, hooks, database } = {}) {
